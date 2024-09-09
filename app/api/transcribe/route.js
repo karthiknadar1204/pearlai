@@ -1,72 +1,115 @@
-import { NextResponse } from "next/server";
-import axios from "axios";
-import ytdl from "ytdl-core";
-import { PassThrough } from "stream";
+import ytdl from 'ytdl-core';
+import { YoutubeTranscript } from 'youtube-transcript';
+import fsSync from 'fs';
+import { promises as fs } from 'fs';
+import path from 'path';
+import url from 'url';
+import ffmpeg from 'fluent-ffmpeg';
 
-const streamToBuffer = (stream) => {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on("data", (chunk) => chunks.push(chunk));
-    stream.on("end", () => resolve(Buffer.concat(chunks)));
-    stream.on("error", reject);
-  });
-};
+const videoDir = 'videos';
 
-export async function POST(request) {
-  const formData = await request.formData();
-  const videoUrl = formData.get("file");
-  const apiKEY = process.env.OPENAI_API_KEY
-  console.log("API Key:", apiKEY); 
+if (!fsSync.existsSync(videoDir)) {
+  fsSync.mkdirSync(videoDir);
+}
 
-  if (!apiKEY) {
-    return NextResponse.json(
-      {
-        message:
-          "You need to set your API Key as env variable or with the input.",
-      },
-      { status: 401, statusText: "Unauthorized" }
-    );
-  }
+export async function POST(req) {
+  const { videoId, videoUrl, chunks } = await req.json();
 
-  if (!ytdl.validateURL(videoUrl)) {
-    return NextResponse.json(
-      {
-        message: "Invalid YouTube URL.",
-      },
-      { status: 400, statusText: "Bad Request" }
-    );
+  if (!videoId && !videoUrl) {
+    return new Response(JSON.stringify({ message: 'Either video ID or video URL must be provided' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 
   try {
-    const audioStream = ytdl(videoUrl, {
-      filter: "audioonly",
-      quality: "highestaudio",
+    console.log('Video download process started...');
+    const { videoFilename, transcriptFilename } = await videoDownload({ videoId, videoUrl });
+
+    console.log('Video downloaded, splitting process starting...');
+    const videoSplitFiles = await Promise.all(
+      chunks.map(async ({ start, duration }) => videoSplitter(videoFilename, Number(start), Number(duration)))
+    );
+
+    console.log('Video splitting complete');
+    return new Response(JSON.stringify({
+      videoFilename,
+      transcriptFilename,
+      videoSplitFiles,
+      message: 'Files downloaded and split successfully',
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    console.error('Error in video or transcript processing:', error);
+    return new Response(JSON.stringify({ message: 'An error occurred while downloading the video and transcript.' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+}
+
+async function videoDownload(opts) {
+  const { videoId, videoUrl } = opts;
+
+  return new Promise((resolve, reject) => {
+    let finalVideoId = videoId;
+    if (videoUrl) {
+      const parsedUrl = url.parse(videoUrl.toString(), true);
+      const queryParameters = parsedUrl.query;
+      finalVideoId = queryParameters['v'];
+    }
+
+    if (!finalVideoId) {
+      reject('Invalid video ID or URL');
+      return;
+    }
+
+    const fileId = finalVideoId.toString();
+    const videoFilename = path.join(videoDir, fileId + '.mp4');
+    const transcriptFilename = path.join(videoDir, fileId + '.json');
+
+    console.log('Starting video download...');
+    const videoStream = ytdl(`https://www.youtube.com/watch?v=${finalVideoId}`);
+
+    videoStream.pipe(fsSync.createWriteStream(videoFilename)).on('close', async () => {
+      console.log('Video download complete');
+      try {
+        const transcripts = await YoutubeTranscript.fetchTranscript(finalVideoId.toString());
+        console.log('Transcript fetched successfully');
+        await fs.writeFile(transcriptFilename, JSON.stringify(transcripts));
+        resolve({
+          videoFilename,
+          transcriptFilename,
+        });
+      } catch (err) {
+        console.error('Error fetching transcript:', err);
+        reject('Error downloading transcript: ' + err.message);
+      }
     });
 
-    const audioBuffer = await streamToBuffer(audioStream);
+    videoStream.on('error', (err) => {
+      console.error('Error downloading video:', err);
+      reject('Error downloading video: ' + err.message);
+    });
+  });
+}
 
-    const openAIFormData = new FormData();
-    openAIFormData.append(
-      "file",
-      new Blob([audioBuffer], { type: "audio/mpeg" }),
-      "audio.mp3"
-    );
-    openAIFormData.append("model", "whisper-1");
-
-    const { data } = await axios.post(
-      "https://api.openai.com/v1/audio/transcriptions",
-      openAIFormData,
-      {
-        headers: {
-          Authorization: `Bearer ${apiKEY}`,
-          "Content-Type": "multipart/form-data",
-        },
-      }
-    );
-
-    return NextResponse.json({ data });
-  } catch (error) {
-    console.error(error.response?.data?.error?.message || error.message);
-    return NextResponse.json({ message: "Error" }, { status: 500 });
-  }
+async function videoSplitter(filename, start, duration) {
+  const outputFilename = `${filename}-${start}-${duration}.mp4`;
+  return new Promise((resolve, reject) => {
+    ffmpeg(filename)
+      .setStartTime(start)
+      .setDuration(duration)
+      .outputOptions('-c copy')
+      .on('end', () => {
+        resolve(outputFilename);
+      })
+      .on('error', (err) => {
+        console.log('Error while splitting', err);
+        reject(err);
+      })
+      .save(outputFilename);
+  });
 }

@@ -1,32 +1,45 @@
 "use client";
 
 import React, { useState } from "react";
-import axios from "axios";
 
 const Page = () => {
   const [videoLink, setVideoLink] = useState("");
   const [embedLink, setEmbedLink] = useState("");
   const [transcription, setTranscription] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
 
   const handleLoad = () => {
-    const embedUrl = videoLink.replace("watch?v=", "embed/");
-    setEmbedLink(embedUrl);
+    const videoId = new URL(videoLink).searchParams.get("v");
+    if (videoId) {
+      const embedUrl = `https://www.youtube.com/embed/${videoId}`;
+      setEmbedLink(embedUrl);
+    }
   };
 
   const handleTranscribe = async () => {
+    setIsLoading(true);
     try {
-      const formData = new FormData();
-      formData.append("file", videoLink);
-
-      const response = await axios.post("/api/transcribe", formData, {
+      const videoId = new URL(videoLink).searchParams.get("v");
+      const response = await fetch("/api/transcribe", {
+        method: "POST",
         headers: {
-          "Content-Type": "multipart/form-data",
+          "Content-Type": "application/json",
         },
+        body: JSON.stringify({ videoId }),
       });
 
-      setTranscription(response.data.data.text);
+      if (!response.ok) {
+        throw new Error("Failed to transcribe video");
+      }
+
+      const data = await response.json();
+      const transcriptContent = await fetch(data.transcriptFilename).then(res => res.text());
+      setTranscription(transcriptContent);
     } catch (error) {
-      console.error("Error transcribing:", error);
+      console.error("Error transcribing video:", error);
+      setTranscription("Error occurred while transcribing the video.");
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -48,8 +61,9 @@ const Page = () => {
       <button
         onClick={handleTranscribe}
         className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"
+        disabled={isLoading}
       >
-        Transcribe
+        {isLoading ? "Transcribing..." : "Transcribe"}
       </button>
       {embedLink && (
         <div className="mt-4">
